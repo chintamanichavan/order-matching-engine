@@ -1,14 +1,15 @@
-# Cargo
-/target/
-**/target/
-**/*.rs.bk
-
-# IDE
-.vscode/
+build/
+cmake-build-*/
+.cache/
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
 .idea/
-
-# OS
-.DS_Store
-
-# Env
-.env
+.vscode/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
