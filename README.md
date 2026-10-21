@@ -4,7 +4,7 @@ Single-instrument matching engine in C++23. Price-time priority Limit Order Book
 
 ## Status
 
-In active development. Single-thread core under construction. Public benchmarks will land once the single-thread engine and harness are honest. Until then, this README is the truth: no numbers, no promises.
+The single-thread engine works and has been measured. On a realistic stream of 2,000,000 adds, crosses, cancels and modifies, one call takes 90 ns at the median, 220 ns at p99 and about 310 ns at p99.9, with no heap allocation. Before the latency study it was 6.7 to 7.7 µs at p99.9. [docs/LATENCY.md](docs/LATENCY.md) has the method, what was predicted before measuring, each fix and what it changed, and what is still slow.
 
 ## Why
 
@@ -16,10 +16,10 @@ In active development. Single-thread core under construction. Public benchmarks 
 
 - Single instrument, integer tick prices (no floats in price math).
 - Order types: Limit, Market, IOC, FOK, Post-Only. Lifecycle: New / Ack / Fill / PartialFill / Cancel / Reject / Expire.
-- `std::map<Price, std::deque<Order>>` for the resting book; `std::unordered_map<OrderId, Locator>` for O(log n) cancel.
-- Append-only event log; deterministic replay from `(seed, event_stream)`.
+- `std::pmr::map<Price, std::pmr::list<Order>>` for the resting book, memory from one pool; an order index that holds each order's place in its queue, so cancel and modify go straight to it.
+- Audit and market-data logs kept as fixed rings of the latest 10,000 events; deterministic replay from `(seed, event_stream)`.
 - Circuit breaker (warn / trigger thresholds; halt + resume protocol).
-- Google Benchmark harness + HdrHistogram_c latency capture. Methodology in `docs/BENCH.md`.
+- A per-call latency harness (`bench/latency.cpp`) and a Google Benchmark throughput suite (`bench/lob_bench.cpp`). Method and results in `docs/LATENCY.md`.
 
 ## What's deliberately out of scope (v1)
 
@@ -44,6 +44,16 @@ cmake -S . -B build -G Ninja -DRTRADE_BUILD_BENCH=ON
 cmake --build build
 ./build/bench/rtrade_bench
 ```
+
+Per-call latency (prints JSON; see `docs/LATENCY.md`):
+
+```sh
+cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --target latency
+taskset -c 3 ./build-release/latency 2000000 > run.json
+```
+
+Browser demo (WebAssembly, built in the Emscripten Docker image): `wasm/build.sh`.
 
 ## License
 

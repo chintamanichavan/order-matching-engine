@@ -11,6 +11,7 @@ set(INSTALL_GTEST   OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 add_executable(rtrade_tests
+  bounded_log_test.cpp
   lob_test.cpp
   simulator_test.cpp
 )

@@ -1,11 +1,13 @@
 #pragma once
 
+#include "rtrade/bounded_log.hpp"
 #include "rtrade/types.hpp"
 
 #include <cstddef>
-#include <deque>
+#include <list>
 #include <functional>
 #include <map>
+#include <memory_resource>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -19,21 +21,18 @@ struct Level {
   std::size_t order_count;
 };
 
-// Locator: where a resting order lives in the book.
-// Stored in by_id_ so cancel/modify can find it in O(log n_levels) + O(1) FIFO walk.
-struct OrderLocator {
-  Side  side;
-  Price price;
-  // Index inside the deque at this price level. Cheap to recompute by scanning the
-  // deque on cancel, but we keep the price+side so we know which map to look in.
-};
-
 // Single-instrument, single-threaded matching engine.
-// Price-time priority. Integer-tick prices. No allocation on the hot path
-// after warm-up (deque grows once, then reuses capacity).
+// Price-time priority. Integer-tick prices. After warm-up, submit, cancel and
+// modify make no heap allocations when the caller passes in its own event
+// buffer: the logs are fixed rings and the book's memory comes from a pool.
 class LimitOrderBook {
 public:
   LimitOrderBook();
+
+  // Not copyable or movable: the order index holds positions inside the
+  // book's own queues, which a copy would still point back into.
+  LimitOrderBook(const LimitOrderBook&) = delete;
+  LimitOrderBook& operator=(const LimitOrderBook&) = delete;
 
   // Submit an order. Returns the events generated (Ack, zero-or-more Trades,
   // or a single Reject). All events are also written to the append-only audit log.
@@ -54,6 +53,13 @@ public:
   //   - unknown id → Reject (Unknown).
   [[nodiscard]] std::vector<Event> modify(OrderId id, Price new_price, Quantity new_qty, Timestamp ts);
 
+  // The same three calls, writing their events into `out` (cleared first)
+  // instead of a new vector. A caller that reuses one `out` across calls
+  // stops paying for an allocation on every call.
+  void submit(Order o, std::vector<Event>& out);
+  void cancel(OrderId id, Timestamp ts, std::vector<Event>& out);
+  void modify(OrderId id, Price new_price, Quantity new_qty, Timestamp ts, std::vector<Event>& out);
+
   // Read-only views.
   [[nodiscard]] std::optional<Price>     best_bid() const noexcept;
   [[nodiscard]] std::optional<Price>     best_ask() const noexcept;
@@ -63,16 +69,18 @@ public:
   [[nodiscard]] std::vector<Level> bid_levels(std::size_t n) const;
   [[nodiscard]] std::vector<Level> ask_levels(std::size_t n) const;
 
-  // Append-only audit log: every event the engine has emitted, in order.
-  // Sequence numbers are dense and start at 1. ts_ns is non-decreasing.
-  [[nodiscard]] const std::vector<EventEnvelope>& audit_log() const noexcept { return log_; }
+  // The most recent events the engine has emitted, oldest first (up to
+  // kLogCapacity). Sequence numbers are dense and start at 1; ts_ns is
+  // non-decreasing. Older entries are dropped, never shifted.
+  static constexpr std::size_t kLogCapacity = 10'000;
+  [[nodiscard]] const BoundedLog<EventEnvelope>& audit_log() const noexcept { return log_; }
 
   // ─── Market-data feed (L3 order-by-order, ITCH-style) ────────────
   using MarketDataSubscriber = std::function<void(const MarketDataEnvelope&)>;
   void subscribe_market_data(MarketDataSubscriber sub);
 
   // Read the cumulative L3 feed (useful for replay / debugging).
-  [[nodiscard]] const std::vector<MarketDataEnvelope>& market_data_log() const noexcept { return md_log_; }
+  [[nodiscard]] const BoundedLog<MarketDataEnvelope>& market_data_log() const noexcept { return md_log_; }
 
   // ─── Telemetry ───────────────────────────────────────────────────
   [[nodiscard]] const Telemetry& telemetry() const noexcept { return telemetry_; }
@@ -116,21 +124,29 @@ public:
   [[nodiscard]] std::int64_t net_position(ParticipantId participant) const noexcept;
 
 private:
-  // Build events for a submission/cancellation/modify without touching the
-  // audit log. Public wrappers commit to the log atomically.
-  std::vector<Event> submit_impl_(Order o);
-  std::vector<Event> cancel_impl_(OrderId id, Timestamp ts);
-  std::vector<Event> modify_impl_(OrderId id, Price new_price, Quantity new_qty, Timestamp ts);
+  // Append the events of a submission/cancellation/modify to `out` without
+  // touching the audit log. Public wrappers commit to the log atomically.
+  void submit_impl_(Order o, std::vector<Event>& out);
+  void cancel_impl_(OrderId id, Timestamp ts, std::vector<Event>& out);
+  void modify_impl_(OrderId id, Price new_price, Quantity new_qty, Timestamp ts, std::vector<Event>& out);
 
-  // Find the resting Order matching id; returns nullptr if not found.
-  [[nodiscard]] const Order* find_resting_(OrderId id) const;
-
-  // Append every emitted event to the audit log, return a copy for the caller.
-  std::vector<Event> commit_(std::vector<Event> events, Timestamp ts);
+  // Append every emitted event to the audit log.
+  void commit_(const std::vector<Event>& events, Timestamp ts);
 
   // Bids descend by price; asks ascend.
-  using BidBook = std::map<Price, std::deque<Order>, std::greater<Price>>;
-  using AskBook = std::map<Price, std::deque<Order>>;
+  // Each price level is a FIFO queue. A list, so that an order's position stays
+  // valid while others come and go: cancel and modify go straight to it.
+  using Queue = std::pmr::list<Order>;
+  using BidBook = std::pmr::map<Price, Queue, std::greater<Price>>;
+  using AskBook = std::pmr::map<Price, Queue>;
+
+  // Where a resting order lives: its side and price pick the level, `at` is
+  // its place in that level's queue.
+  struct Locator {
+    Side side;
+    Price price;
+    Queue::iterator at;
+  };
 
   // Walk the opposite side matching the incoming taker until fully filled or
   // no more crossing levels remain. Emits one Trade per maker consumed.
@@ -142,13 +158,19 @@ private:
   // Rest a (possibly partially-filled) order on its own side at its limit price.
   void rest(Order o);
 
-  BidBook bids_;
-  AskBook asks_;
+  // Price levels, their queues and the order index all take memory from one
+  // pool, so memory freed by a cancel is reused by the next order instead of
+  // going back to the general heap.
+  std::pmr::unsynchronized_pool_resource pool_;
 
-  std::unordered_map<OrderId, OrderLocator> by_id_;
+  BidBook bids_{&pool_};
+  AskBook asks_{&pool_};
+
+  static constexpr std::size_t kExpectedOrders = 1 << 16;  // index sized up front, so it never rehashes below this
+  std::pmr::unordered_map<OrderId, Locator> by_id_{kExpectedOrders, &pool_};
   std::size_t resting_count_{0};
 
-  std::vector<EventEnvelope> log_;
+  BoundedLog<EventEnvelope> log_{kLogCapacity};
   std::uint64_t              next_seq_{1};
   Timestamp                  last_ts_{0};
 
@@ -172,7 +194,7 @@ private:
 
   // Market data feed
   std::vector<MarketDataSubscriber> md_subscribers_;
-  std::vector<MarketDataEnvelope>   md_log_;
+  BoundedLog<MarketDataEnvelope>   md_log_{kLogCapacity};
   std::uint64_t                     md_next_seq_{1};
 
   void emit_md_(MarketDataEvent ev, Timestamp ts);

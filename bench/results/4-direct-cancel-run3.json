@@ -1,0 +1,18 @@
+{
+  "ops": 2000000, "warmup": 200000, "resting_at_end": 4436, "ticks_per_ns": 4.3917,
+  "timing_floor_ns": {"p50": 10, "p99": 20},
+  "allocations_per_call": 0.000, "trims": 0, "regrowths": 0,
+  "trim_ns": {"p50": 0, "max": 0},
+  "latency_ns": {
+    "add": {"calls": 1075883, "p50": 90, "p90": 110, "p99": 150, "p99_9": 220, "p99_99": 1182, "max": 4227},
+    "cross": {"calls": 199597, "p50": 100, "p90": 210, "p99": 300, "p99_9": 390, "p99_99": 771, "max": 2775},
+    "cancel": {"calls": 624005, "p50": 80, "p90": 100, "p99": 120, "p99_9": 180, "p99_99": 500, "max": 2274},
+    "modify": {"calls": 100515, "p50": 150, "p90": 200, "p99": 260, "p99_9": 360, "p99_99": 1512, "max": 4849},
+    "all": {"calls": 2000000, "p50": 90, "p90": 120, "p99": 220, "p99_9": 320, "p99_99": 661, "max": 4849}
+  },
+  "control_ns": {
+    "busy_loop": {"calls": 2000000, "p50": 90, "p90": 90, "p99": 90, "p99_9": 90, "p99_99": 420, "max": 13395}
+  },
+  "calls_over_5us": {"engine": 0, "busy_loop": 3},
+  "slowest_0_1_percent": {"threshold_ns": 320, "calls": 2084, "with_trim": 0, "with_regrowth": 0, "with_allocation_over_16kb": 0, "with_any_allocation": 0, "with_trades": 1548, "add": 272, "cross": 1335, "cancel": 201, "modify": 276}
+}

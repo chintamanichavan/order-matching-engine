@@ -6,21 +6,6 @@
 
 namespace rtrade {
 
-namespace {
-// Bounded growth for the long-running browser demo. Hard cap on retained
-// entries; truncate in batches so amortized cost is O(1) per insertion.
-// Sequence numbers stay monotonic across truncation — only the prefix drops.
-constexpr std::size_t LOG_RETAIN_MAX     = 10'000;
-constexpr std::size_t LOG_TRUNCATE_AT    = 12'000;
-constexpr std::size_t LOG_TRUNCATE_BATCH = LOG_TRUNCATE_AT - LOG_RETAIN_MAX;
-
-template <class V>
-void truncate_log_if_needed(V& log) {
-  if (log.size() >= LOG_TRUNCATE_AT) {
-    log.erase(log.begin(), log.begin() + LOG_TRUNCATE_BATCH);
-  }
-}
-} // namespace
 
 LimitOrderBook::LimitOrderBook() = default;
 
@@ -173,15 +158,14 @@ std::vector<Event> LimitOrderBook::uncross_at_(Price clearing, Timestamp ts) {
 
 std::vector<Event> LimitOrderBook::end_auction(Timestamp ts) {
   std::vector<Event> events;
-  if (auction_ != AuctionState::Collecting) {
-    return commit_(std::move(events), ts);
+  if (auction_ == AuctionState::Collecting) {
+    auction_ = AuctionState::None;
+    if (auto clearing = find_clearing_price_(); clearing.has_value()) {
+      events = uncross_at_(*clearing, ts);
+    }
   }
-  auction_ = AuctionState::None;
-
-  if (auto clearing = find_clearing_price_(); clearing.has_value()) {
-    events = uncross_at_(*clearing, ts);
-  }
-  return commit_(std::move(events), ts);
+  commit_(events, ts);
+  return events;
 }
 
 // ─── Market data ───────────────────────────────────────────────────────
@@ -193,7 +177,6 @@ void LimitOrderBook::subscribe_market_data(MarketDataSubscriber sub) {
 void LimitOrderBook::emit_md_(MarketDataEvent ev, Timestamp ts) {
   MarketDataEnvelope env{md_next_seq_++, ts, std::move(ev)};
   md_log_.push_back(env);
-  truncate_log_if_needed(md_log_);
   for (const auto& sub : md_subscribers_) sub(env);
 }
 
@@ -221,14 +204,13 @@ void LimitOrderBook::update_circuit_from_trade_(Price trade_price) noexcept {
   }
 }
 
-std::vector<Event> LimitOrderBook::commit_(std::vector<Event> events, Timestamp ts) {
+void LimitOrderBook::commit_(const std::vector<Event>& events, Timestamp ts) {
   // Enforce non-decreasing timestamp invariant. A real engine would refuse;
   // here we clamp to last_ts_ so a client clock skew doesn't break replay,
   // and we still produce a monotone sequence.
   if (ts < last_ts_) ts = last_ts_;
   last_ts_ = ts;
 
-  log_.reserve(log_.size() + events.size());
   for (const Event& e : events) {
     log_.push_back(EventEnvelope{next_seq_++, ts, e});
     update_telemetry_from_event_(e);
@@ -236,8 +218,6 @@ std::vector<Event> LimitOrderBook::commit_(std::vector<Event> events, Timestamp 
       update_circuit_from_trade_(t->price);
     }
   }
-  truncate_log_if_needed(log_);
-  return events;
 }
 
 void LimitOrderBook::update_telemetry_from_event_(const Event& e) noexcept {
@@ -355,61 +335,64 @@ void LimitOrderBook::walk_match(OppBook& opp, Order& taker, CrossPred crosses, s
 // Rest the (possibly partially-filled) taker on its own side at its limit price.
 void LimitOrderBook::rest(Order o) {
   const Quantity remaining = o.qty - o.filled;
-  if (o.side == Side::Bid) {
-    bids_[o.price].push_back(o);
-  } else {
-    asks_[o.price].push_back(o);
-  }
-  by_id_.emplace(o.id, OrderLocator{o.side, o.price});
+  Queue& queue = (o.side == Side::Bid) ? bids_[o.price] : asks_[o.price];
+  queue.push_back(o);
+  by_id_.emplace(o.id, Locator{o.side, o.price, std::prev(queue.end())});
   ++resting_count_;
   emit_md_(MdAddOrder{o.id, o.side, o.price, remaining}, o.ts);
 }
 
+void LimitOrderBook::submit(Order o, std::vector<Event>& out) {
+  out.clear();
+  const Timestamp ts = o.ts;
+  submit_impl_(std::move(o), out);
+  commit_(out, ts);
+}
+
+void LimitOrderBook::cancel(OrderId id, Timestamp ts, std::vector<Event>& out) {
+  out.clear();
+  cancel_impl_(id, ts, out);
+  commit_(out, ts);
+}
+
+void LimitOrderBook::modify(OrderId id, Price new_price, Quantity new_qty, Timestamp ts, std::vector<Event>& out) {
+  out.clear();
+  modify_impl_(id, new_price, new_qty, ts, out);
+  commit_(out, ts);
+}
+
 std::vector<Event> LimitOrderBook::submit(Order o) {
-  Timestamp ts = o.ts;
-  return commit_(submit_impl_(std::move(o)), ts);
+  std::vector<Event> out;
+  submit(std::move(o), out);
+  return out;
 }
 
 std::vector<Event> LimitOrderBook::cancel(OrderId id, Timestamp ts) {
-  return commit_(cancel_impl_(id, ts), ts);
+  std::vector<Event> out;
+  cancel(id, ts, out);
+  return out;
 }
 
 std::vector<Event> LimitOrderBook::modify(OrderId id, Price new_price, Quantity new_qty, Timestamp ts) {
-  return commit_(modify_impl_(id, new_price, new_qty, ts), ts);
-}
-
-const Order* LimitOrderBook::find_resting_(OrderId id) const {
-  auto it = by_id_.find(id);
-  if (it == by_id_.end()) return nullptr;
-  const auto& loc = it->second;
-
-  auto find_in = [id](const auto& book, Price p) -> const Order* {
-    auto level_it = book.find(p);
-    if (level_it == book.end()) return nullptr;
-    for (const Order& o : level_it->second) {
-      if (o.id == id) return &o;
-    }
-    return nullptr;
-  };
-
-  return loc.side == Side::Bid ? find_in(bids_, loc.price) : find_in(asks_, loc.price);
-}
-
-std::vector<Event> LimitOrderBook::modify_impl_(OrderId id, Price new_price, Quantity new_qty, Timestamp ts) {
   std::vector<Event> out;
+  modify(id, new_price, new_qty, ts, out);
+  return out;
+}
 
+void LimitOrderBook::modify_impl_(OrderId id, Price new_price, Quantity new_qty, Timestamp ts, std::vector<Event>& out) {
   // Modify during halt would partially-execute (cancel succeeds, replace rejects).
   // Reject up front; participants who want to pull resting orders use cancel().
   if (circuit_ == CircuitState::Triggered) {
     out.push_back(Reject{id, RejectReason::CircuitBreakerTriggered, ts});
-    return out;
+    return;
   }
 
-  const Order* existing = find_resting_(id);
-  if (!existing) {
+  const auto found = by_id_.find(id);
+  if (found == by_id_.end()) {
     out.push_back(Reject{id, RejectReason::Unknown, ts});
-    return out;
+    return;
   }
+  Order* existing = &*found->second.at;
 
   // Snapshot fields before we mutate the book.
   const Side      side       = existing->side;
@@ -421,71 +404,55 @@ std::vector<Event> LimitOrderBook::modify_impl_(OrderId id, Price new_price, Qua
   // Replacement qty must exceed cumulative fill; otherwise reject.
   if (new_qty.units <= cum_filled.units) {
     out.push_back(Reject{id, RejectReason::ModifyBelowFilledQty, ts});
-    return out;
+    return;
   }
 
   // Fast path: same price + qty reduction (still above filled) → keep time priority.
   if (new_price == old_price && new_qty.units < old_qty.units) {
-    auto adjust_in = [&](auto& book) {
-      auto level_it = book.find(old_price);
-      if (level_it == book.end()) return false;
-      for (Order& o : level_it->second) {
-        if (o.id == id) { o.qty = new_qty; return true; }
-      }
-      return false;
-    };
-    [[maybe_unused]] const bool ok = (side == Side::Bid) ? adjust_in(bids_) : adjust_in(asks_);
+    existing->qty = new_qty;
     out.push_back(Modified{id, new_price, new_qty, ts});
-    return out;
+    return;
   }
 
   // Slow path: cancel-replace. Loses time priority.
-  auto cancel_evts = cancel_impl_(id, ts);
-  for (auto& e : cancel_evts) out.push_back(std::move(e));
+  cancel_impl_(id, ts, out);
+  submit_impl_(Order{id, side, type, new_price, new_qty, /*filled=*/Quantity{0}, ts}, out);
 
-  Order replacement{id, side, type, new_price, new_qty, /*filled=*/Quantity{0}, ts};
-  auto submit_evts = submit_impl_(std::move(replacement));
-  for (auto& e : submit_evts) out.push_back(std::move(e));
-
-  return out;
 }
 
-std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
-  std::vector<Event> out;
-  out.reserve(4);
-
+void LimitOrderBook::submit_impl_(Order o, std::vector<Event>& out) {
   if (circuit_ == CircuitState::Triggered) {
     out.push_back(Reject{o.id, RejectReason::CircuitBreakerTriggered, o.ts});
-    return out;
+    return;
   }
 
   if (by_id_.find(o.id) != by_id_.end()) {
     out.push_back(Reject{o.id, RejectReason::DuplicateOrderId, o.ts});
-    return out;
+    return;
   }
 
   if (const RejectReason r = check_risk_(o); r != RejectReason::Unknown) {
     out.push_back(Reject{o.id, r, o.ts});
-    return out;
+    return;
   }
 
   // Auction collecting phase: rest Limits + PostOnly only; reject non-rest types.
   if (auction_ == AuctionState::Collecting) {
     if (o.type == OrderType::Market) {
       out.push_back(Reject{o.id, RejectReason::Unknown, o.ts});
-      return out;
+      return;
     }
     if (o.type == OrderType::IOC) {
       out.push_back(Reject{o.id, RejectReason::ImmediateOrCancelUnfilled, o.ts});
-      return out;
+      return;
     }
     if (o.type == OrderType::FOK) {
       out.push_back(Reject{o.id, RejectReason::FillOrKillUnfilled, o.ts});
-      return out;
+      return;
     }
     out.push_back(Ack{o.id, o.ts});
     rest(o);
-    return out;
+    return;
   }
 
   const bool is_market = (o.type == OrderType::Market);
@@ -499,11 +466,11 @@ std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
       : (!bids_.empty() && crosses_for_sell(bids_.begin()->first, o.price, false));
     if (would_cross) {
       out.push_back(Reject{o.id, RejectReason::PostOnlyWouldCross, o.ts});
-      return out;
+      return;
     }
     out.push_back(Ack{o.id, o.ts});
     rest(o);
-    return out;
+    return;
   }
 
   // FOK: must fill the whole quantity at acceptable prices, or reject.
@@ -513,7 +480,7 @@ std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
       : available_crossing_qty_sell(bids_, o.price, false);
     if (avail.units < o.qty.units) {
       out.push_back(Reject{o.id, RejectReason::FillOrKillUnfilled, o.ts});
-      return out;
+      return;
     }
     out.push_back(Ack{o.id, o.ts});
     if (is_buy) {
@@ -521,7 +488,7 @@ std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
     } else {
       walk_match(bids_, o, [&](Price m){ return crosses_for_sell(m, o.price, false); }, out, taker_cancelled);
     }
-    return out;
+    return;
   }
 
   // IOC: if nothing to cross, reject. Otherwise walk and silently cancel residual.
@@ -531,7 +498,7 @@ std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
       : (!bids_.empty() && crosses_for_sell(bids_.begin()->first, o.price, false));
     if (!can_cross) {
       out.push_back(Reject{o.id, RejectReason::ImmediateOrCancelUnfilled, o.ts});
-      return out;
+      return;
     }
     out.push_back(Ack{o.id, o.ts});
     if (is_buy) {
@@ -540,7 +507,7 @@ std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
       walk_match(bids_, o, [&](Price m){ return crosses_for_sell(m, o.price, false); }, out, taker_cancelled);
     }
     // Residual is dropped; don't rest.
-    return out;
+    return;
   }
 
   // Market: cross unconditionally; residual is dropped.
@@ -551,7 +518,7 @@ std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
     } else {
       walk_match(bids_, o, [&](Price m){ return crosses_for_sell(m, o.price, true); }, out, taker_cancelled);
     }
-    return out;
+    return;
   }
 
   // Limit: cross what we can, rest the residual at the limit price.
@@ -564,17 +531,13 @@ std::vector<Event> LimitOrderBook::submit_impl_(Order o) {
   if (!taker_cancelled && o.filled.units < o.qty.units) {
     rest(o);
   }
-  return out;
 }
 
-std::vector<Event> LimitOrderBook::cancel_impl_(OrderId id, Timestamp ts) {
-  std::vector<Event> out;
-  out.reserve(1);
-
+void LimitOrderBook::cancel_impl_(OrderId id, Timestamp ts, std::vector<Event>& out) {
   auto it = by_id_.find(id);
   if (it == by_id_.end()) {
     out.push_back(Reject{id, RejectReason::Unknown, ts});
-    return out;
+    return;
   }
 
   const auto loc = it->second;
@@ -582,28 +545,18 @@ std::vector<Event> LimitOrderBook::cancel_impl_(OrderId id, Timestamp ts) {
 
   auto erase_from = [&](auto& book) {
     auto level_it = book.find(loc.price);
-    if (level_it == book.end()) return false;
-    auto& dq = level_it->second;
-    auto order_it = std::find_if(dq.begin(), dq.end(),
-      [id](const Order& o) { return o.id == id; });
-    if (order_it == dq.end()) return false;
-    dq.erase(order_it);
-    if (dq.empty()) book.erase(level_it);
-    return true;
+    level_it->second.erase(loc.at);
+    if (level_it->second.empty()) book.erase(level_it);
   };
-
-  const bool removed = (loc.side == Side::Bid)
-    ? erase_from(bids_)
-    : erase_from(asks_);
-
-  if (removed) {
-    --resting_count_;
-    out.push_back(CancelAck{id, ts});
-    emit_md_(MdDeleteOrder{id}, ts);
+  if (loc.side == Side::Bid) {
+    erase_from(bids_);
   } else {
-    out.push_back(Reject{id, RejectReason::Unknown, ts});
+    erase_from(asks_);
   }
-  return out;
+
+  --resting_count_;
+  out.push_back(CancelAck{id, ts});
+  emit_md_(MdDeleteOrder{id}, ts);
 }
 
 std::optional<Price> LimitOrderBook::best_bid() const noexcept {

@@ -17,6 +17,7 @@ set(RTRADE_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conver
 
 option(RTRADE_BUILD_TESTS "Build unit tests" ON)
 option(RTRADE_BUILD_BENCH "Build benchmarks"   OFF)
+option(RTRADE_BUILD_LATENCY "Build the per-call latency study (docs/LATENCY.md)" ON)
 option(RTRADE_WERROR      "Treat warnings as errors" ON)
 set(RTRADE_SANITIZE "" CACHE STRING "Sanitizer: address | undefined | thread (empty = off)")
 
@@ -49,4 +50,10 @@ endif()
 
 if(RTRADE_BUILD_BENCH)
   add_subdirectory(bench)
+endif()
+
+if(RTRADE_BUILD_LATENCY)
+  add_executable(latency bench/latency.cpp)
+  target_link_libraries(latency PRIVATE rtrade)
+  target_compile_options(latency PRIVATE ${RTRADE_WARNINGS})
 endif()

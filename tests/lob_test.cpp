@@ -364,7 +364,7 @@ TEST(PostOnly, RejectsIfWouldCrossAtBetterPrice) {
 // ─── Auctions ──────────────────────────────────────────────────────────
 
 namespace {
-std::size_t count_trades_in_log(const std::vector<EventEnvelope>& log) {
+std::size_t count_trades_in_log(const BoundedLog<EventEnvelope>& log) {
   std::size_t n = 0;
   for (const auto& env : log) if (std::holds_alternative<Trade>(env.event)) ++n;
   return n;
@@ -894,22 +894,73 @@ TEST(CircuitBreaker, TriggeredStateSticksWithoutResume) {
   EXPECT_EQ(lob.circuit_state(), CircuitState::Normal);
 }
 
-TEST(AuditLog, TruncatesAfterSoftCap) {
-  // Generate many events to exceed the 12k truncate threshold and confirm the
-  // log shrinks back to ≤ 10k while sequence numbers stay monotonic.
+TEST(AuditLog, KeepsOnlyTheMostRecentEntries) {
+  // 12,500 resting adds emit 12,500 events; the log keeps the last 10,000,
+  // oldest first, with dense sequence numbers.
   LimitOrderBook lob;
   for (OrderId id = 1; id <= 12'500; ++id) {
     (void)lob.submit(make_limit(id, Side::Bid, 100, 1));
   }
   const auto& log = lob.audit_log();
-  EXPECT_LE(log.size(), 10'500u);   // truncated
-  EXPECT_GT(log.size(), 9'000u);    // not over-truncated
-  // Seq monotonicity holds across truncation.
+  ASSERT_EQ(log.size(), LimitOrderBook::kLogCapacity);
   for (std::size_t i = 1; i < log.size(); ++i) {
     EXPECT_EQ(log[i].seq, log[i-1].seq + 1);
   }
-  // The first surviving seq should be > the number of dropped entries.
-  EXPECT_GT(log.front().seq, 1'500u);
+  EXPECT_EQ(log.front().seq, 2'501u);
+  EXPECT_EQ(log.back().seq, 12'500u);
+}
+
+TEST(LimitOrderBookCancel, MiddleOfQueueKeepsTheRestInTimeOrder) {
+  LimitOrderBook lob;
+  for (OrderId id = 1; id <= 5; ++id) (void)lob.submit(make_limit(id, Side::Ask, 100, 1));
+  (void)lob.cancel(3, 0);
+  (void)lob.modify(4, Price{100}, Quantity{1}, 0);  // same size: loses priority, goes last
+  const auto events = lob.submit(make_limit(6, Side::Bid, 100, 4));
+  std::vector<OrderId> makers;
+  for (const Event& e : events) {
+    if (const auto* t = std::get_if<Trade>(&e)) makers.push_back(t->maker_id);
+  }
+  EXPECT_EQ(makers, (std::vector<OrderId>{1, 2, 5, 4}));
+  EXPECT_EQ(lob.size(), 0u);
+}
+
+TEST(LimitOrderBookOutParam, MatchesTheReturningCalls) {
+  // The same orders through both APIs give the same events, and the reused
+  // buffer holds only the latest call's events.
+  LimitOrderBook a;
+  LimitOrderBook b;
+  std::vector<Event> out;
+  const Order orders[] = {make_limit(1, Side::Ask, 100, 5), make_limit(2, Side::Ask, 101, 5),
+                          make_limit(3, Side::Bid, 101, 7)};
+  for (const Order& o : orders) {
+    const auto returned = a.submit(o);
+    b.submit(o, out);
+    ASSERT_EQ(out.size(), returned.size());
+    for (std::size_t i = 0; i < out.size(); ++i) EXPECT_EQ(out[i].index(), returned[i].index());
+  }
+  EXPECT_EQ(out.size(), 3u);  // Ack + two trades, nothing left from earlier calls
+
+  const auto modified = a.modify(2, Price{102}, Quantity{4}, 1);
+  b.modify(2, Price{102}, Quantity{4}, 1, out);
+  ASSERT_EQ(out.size(), modified.size());
+
+  const auto cancelled = a.cancel(2, 2);
+  b.cancel(2, 2, out);
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_TRUE(holds<CancelAck>(out[0]));
+  EXPECT_EQ(cancelled.size(), 1u);
+  EXPECT_EQ(a.audit_log().size(), b.audit_log().size());
+  EXPECT_EQ(a.size(), b.size());
+}
+
+TEST(LimitOrderBookOutParam, ReusesTheCallersStorage) {
+  LimitOrderBook lob;
+  std::vector<Event> out;
+  out.reserve(16);
+  const Event* storage = out.data();
+  for (OrderId id = 1; id <= 100; ++id) lob.submit(make_limit(id, Side::Bid, 100, 1), out);
+  for (OrderId id = 1; id <= 100; ++id) lob.cancel(id, 0, out);
+  EXPECT_EQ(out.data(), storage);
 }
 
 TEST(AuditLog, EventsMatchReturnedEvents) {
